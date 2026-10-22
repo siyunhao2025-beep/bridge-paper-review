@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -42,6 +43,10 @@ def run(*args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
     if not ok and result.returncode == 0:
         raise AssertionError(f"command unexpectedly passed: {args}\nstdout={result.stdout}")
     return result
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def review_text(reviewer: int, round_number: int, passing: bool) -> str:
@@ -149,16 +154,35 @@ def main() -> None:
     verification = json.loads(run("verify", "--workspace", str(workspace)).stdout)
     assert verification["valid"] is True
 
+    wrong_secretary = run(
+        "record-review",
+        "--workspace", str(workspace),
+        "--agent", "GPT",
+        "--round", "1",
+        ok=False,
+    )
+    assert "已登记秘书" in wrong_secretary.stderr
+
     incomplete = run(
-        "record-review", "--workspace", str(workspace), "--round", "1", ok=False
+        "record-review", "--workspace", str(workspace), "--agent", "Workbuddy",
+        "--round", "1", ok=False
     )
     assert "未完成" in incomplete.stderr
 
     round_one_ids = fill_round(workspace, 1, passing=False, prior_ids=[])
     first_review = json.loads(
-        run("record-review", "--workspace", str(workspace), "--round", "1").stdout
+        run(
+            "record-review", "--workspace", str(workspace),
+            "--agent", "Workbuddy", "--round", "1"
+        ).stdout
     )
     assert first_review["phase"] == "awaiting_revision"
+    secretary_to_lead = Path(first_review["handoff"])
+    assert secretary_to_lead.name == "Workbuddy_1审paper_给GPT.md"
+    secretary_text = secretary_to_lead.read_text(encoding="utf-8")
+    assert "## 可直接复制给主力的话" in secretary_text
+    assert "## 审稿汇总全文" in secretary_text
+    assert "R01-TEST-001" in secretary_text
 
     activated = json.loads(
         run(
@@ -208,18 +232,99 @@ def main() -> None:
     ]
     for issue_id in round_one_ids:
         lead_args.extend(["--resolved", issue_id])
+    invalid_handoff = run(*lead_args, ok=False)
+    assert "主力→秘书 Markdown 交接未通过校验" in invalid_handoff.stderr
+    external_marker_text = f"""# GPT 第 1 次修改完成
+
+- 工作流 ID：`{state['workflow_id']}`
+- 交接方向：主力 → 秘书
+- 修改轮次：1
+- 主力：GPT
+- 接收者：Workbuddy
+- 变更日志：`{change_log}`
+- 变更日志 SHA-256：`{sha256(change_log)}`
+
+## 可直接复制给秘书的话
+
+> 致秘书 Workbuddy：GPT 已完成第一轮修改。请重新打开 {revised} 和 {revised_pdf}，
+> 核对变更日志 {change_log}，逐项复核旧问题，再检查新增矛盾和防御性写作。
+> 不要只读取本标记。完成复审后，请把完整审稿意见写成可复制给主力的 Markdown。
+
+## 修改后文件
+
+- `{revised}` — SHA-256 `{sha256(revised)}`
+- `{revised_pdf}` — SHA-256 `{sha256(revised_pdf)}`
+
+## 已解决问题
+
+{chr(10).join(f'- `{item}`' for item in round_one_ids)}
+
+## 未解决问题
+
+- 无
+
+## 主力核验
+
+- LaTeX 编译、引用、公式和交叉引用检查通过。
+- PDF 与权威可编辑源逐页核对完成。
+- 文件路径、变更日志和旧问题 ID 已复核。
+
+## 复审要求
+
+秘书必须读取修改后的论文和变更日志，在上一轮问题 ID 基础上复审。复审意见必须覆盖创新性、方法统计、证据一致性、期刊适配与防御性写作，并输出一份含“可直接复制给主力的话”的 Markdown。只有全部硬门槛通过后才能确认达到模拟可投稿状态。
+"""
+    fake_external_marker.write_text(external_marker_text, encoding="utf-8")
     handoff = json.loads(run(*lead_args).stdout)
     assert Path(handoff["marker"]).name == "GPT_1修paper.md"
+    assert handoff["handoff"] == handoff["marker"]
     assert handoff["next_round"] == 2
     accepted_state = json.loads((workspace / "bridge-state.json").read_text(encoding="utf-8"))
     assert accepted_state["rounds"]["1"]["revision"]["marker_origin"] == "external_agent"
 
     fill_round(workspace, 2, passing=True, prior_ids=round_one_ids)
+    round_two_card_path = workspace / "round-02" / "scorecard_R02.json"
+    round_two_card = json.loads(round_two_card_path.read_text(encoding="utf-8"))
+    round_two_card["secretary_recommendation"] = "revise"
+    round_two_card_path.write_text(
+        json.dumps(round_two_card, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    missing_secretary_confirmation = run(
+        "record-review",
+        "--workspace", str(workspace),
+        "--agent", "Workbuddy",
+        "--round", "2",
+        ok=False,
+    )
+    assert "秘书尚未给出 secretary_recommendation=ready" in missing_secretary_confirmation.stderr
+    round_two_card["secretary_recommendation"] = "ready"
+    round_two_card_path.write_text(
+        json.dumps(round_two_card, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     second_review = json.loads(
-        run("record-review", "--workspace", str(workspace), "--round", "2").stdout
+        run(
+            "record-review", "--workspace", str(workspace),
+            "--agent", "Workbuddy", "--round", "2"
+        ).stdout
     )
     assert second_review["phase"] == "complete"
+    ready_handoff = Path(second_review["handoff"])
+    assert ready_handoff.name == "Workbuddy_2审paper_给GPT.md"
+    ready_bytes = ready_handoff.read_bytes()
+    ready_text = ready_bytes.decode("utf-8")
+    assert "## 可直接复制给主力的话" in ready_text
+    assert "状态机结论：`ready`" in ready_text
+    assert "最低审稿人总分：9.30 / 10" in ready_text
     assert (workspace / "最终可投稿报告.md").is_file()
+    final_report = (workspace / "最终可投稿报告.md").read_text(encoding="utf-8")
+    assert "## 秘书最终确认" in final_report
+    assert str(ready_handoff) in final_report
+
+    ready_handoff.write_bytes(ready_bytes + "\n未经登记的篡改。\n".encode("utf-8"))
+    tampered_handoff = run("verify", "--workspace", str(workspace), ok=False)
+    assert "秘书→主力交接文件在登记后发生变化" in tampered_handoff.stdout
+    ready_handoff.write_bytes(ready_bytes)
 
     final_verification = json.loads(run("verify", "--workspace", str(workspace)).stdout)
     assert final_verification["valid"] is True
@@ -266,7 +371,7 @@ def main() -> None:
         ).stdout
     )
     pdf_workspace = Path(pdf_init["workspace"])
-    fill_round(pdf_workspace, 1, passing=False, prior_ids=[])
+    pdf_round_ids = fill_round(pdf_workspace, 1, passing=False, prior_ids=[])
     pdf_card_path = pdf_workspace / "round-01" / "scorecard_R01.json"
     pdf_card = json.loads(pdf_card_path.read_text(encoding="utf-8"))
     pdf_card["missing_evidence_actions"] = ["Provide editable TeX or DOCX source"]
@@ -274,7 +379,10 @@ def main() -> None:
         json.dumps(pdf_card, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     pdf_review = json.loads(
-        run("record-review", "--workspace", str(pdf_workspace), "--round", "1").stdout
+        run(
+            "record-review", "--workspace", str(pdf_workspace),
+            "--agent", "Workbuddy", "--round", "1"
+        ).stdout
     )
     assert pdf_review["phase"] == "attention_required"
     assert any("PDF" in item for item in pdf_review["event"]["details"]["attention_reasons"])
@@ -299,6 +407,36 @@ def main() -> None:
     pdf_verification = json.loads(run("verify", "--workspace", str(pdf_workspace)).stdout)
     assert pdf_verification["valid"] is True
 
+    pdf_revised = pdf_case / "only-r1.tex"
+    pdf_change_log = pdf_case / "only-change-log-r1.md"
+    pdf_revised.write_text(
+        "\\documentclass{article}\n\\begin{document}Revised PDF-only case\\end{document}\n",
+        encoding="utf-8",
+    )
+    pdf_change_log.write_text(
+        "# Change log\n\nResolved all five review issues after the editable source was supplied.\n",
+        encoding="utf-8",
+    )
+    generated_args = [
+        "lead-done",
+        "--workspace", str(pdf_workspace),
+        "--agent", "GPT",
+        "--output", str(pdf_revised),
+        "--change-log", str(pdf_change_log),
+        "--check", "Canonical TeX source compiled and all cross-references were checked",
+    ]
+    for issue_id in pdf_round_ids:
+        generated_args.extend(["--resolved", issue_id])
+    generated_handoff = json.loads(run(*generated_args).stdout)
+    generated_marker = Path(generated_handoff["handoff"])
+    generated_text = generated_marker.read_text(encoding="utf-8")
+    assert "## 可直接复制给秘书的话" in generated_text
+    assert "Workbuddy_2审only_给GPT.md" in generated_text
+    pdf_after_handoff = json.loads(
+        run("verify", "--workspace", str(pdf_workspace)).stdout
+    )
+    assert pdf_after_handoff["valid"] is True
+
     print(
         json.dumps(
             {
@@ -309,8 +447,13 @@ def main() -> None:
                 "verified": True,
                 "pdf_only_pause_and_resume": True,
                 "wrong_agent_rejected": True,
+                "wrong_secretary_rejected": True,
                 "scheduled_scan_idempotent": True,
                 "external_marker_accepted": True,
+                "secretary_to_lead_markdown_required": True,
+                "lead_to_secretary_markdown_required": True,
+                "secretary_ready_required": True,
+                "handoff_tampering_detected": True,
             },
             ensure_ascii=False,
             indent=2,

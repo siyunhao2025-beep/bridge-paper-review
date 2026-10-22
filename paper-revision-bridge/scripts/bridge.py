@@ -48,6 +48,21 @@ REQUIRED_REVIEW_HEADINGS = (
     "## 评分",
     "## 投稿建议",
 )
+REQUIRED_LEAD_HANDOFF_HEADINGS = (
+    "## 可直接复制给秘书的话",
+    "## 修改后文件",
+    "## 已解决问题",
+    "## 未解决问题",
+    "## 主力核验",
+    "## 复审要求",
+)
+REQUIRED_SECRETARY_HANDOFF_HEADINGS = (
+    "## 可直接复制给主力的话",
+    "## 本轮五审结论",
+    "## 审稿汇总全文",
+    "## 修改任务单全文",
+    "## 主力回交要求",
+)
 ISSUE_ID_RE = re.compile(r"^R\d{2}-[A-Z][A-Z0-9_-]*-\d{3}$")
 
 
@@ -183,9 +198,15 @@ def workspace_lock(root: Path):
 def phase_next_action(state: dict[str, Any]) -> str:
     phase = state["phase"]
     if phase == "awaiting_review":
-        return "秘书组织五位审稿人审阅当前稿，完成本轮报告、汇总、任务单和评分卡。"
+        return (
+            "秘书必须重新打开当前修改稿，组织五位审稿人复审，完成报告、汇总、任务单和评分卡；"
+            "登记后生成一份可直接复制给主力的 Markdown 交接文件。"
+        )
     if phase == "awaiting_revision":
-        return "主力按本轮任务单修改论文，核验输出后生成完成标记。"
+        return (
+            "主力先读取秘书→主力 Markdown 交接文件，再按任务单修改论文；"
+            "核验输出后生成含“可直接复制给秘书的话”的完成标记。"
+        )
     if phase == "attention_required":
         return "向用户报告缺失证据、审稿冲突、停滞或轮次上限，取得决定后再恢复。"
     return "流程已达到模拟可投稿门槛；保留最终报告和所有版本，不再自动修改。"
@@ -195,6 +216,9 @@ def status_markdown(state: dict[str, Any]) -> str:
     last = state.get("last_event") or {}
     open_issues = state.get("open_issue_ids", [])
     monitor = state.get("monitor") or {}
+    handoffs = state.get("handoffs") or {}
+    secretary_handoff = handoffs.get("secretary_to_lead") or {}
+    lead_handoff = handoffs.get("lead_to_secretary") or {}
     return f"""# 当前状态
 
 - 工作流 ID：`{state['workflow_id']}`
@@ -211,6 +235,8 @@ def status_markdown(state: dict[str, Any]) -> str:
 - 轮询间隔：{monitor.get('interval_minutes') if monitor.get('interval_minutes') is not None else '人工'} 分钟
 - 唤醒适配器：`{monitor.get('wake_adapter', 'unknown')}`
 - 最近扫描：{monitor.get('last_scan_at') or '尚未扫描'}
+- 最近秘书→主力交接：`{secretary_handoff.get('path', '尚无')}`
+- 最近主力→秘书交接：`{lead_handoff.get('path', '尚无')}`
 - 更新时间：{state['updated_at']}
 
 ## 下一步
@@ -270,6 +296,19 @@ def safe_filename(value: str, fallback: str) -> str:
     value = re.sub(r"[<>:\"/\\|?*\x00-\x1f]", "_", value).strip(" .")
     value = re.sub(r"\s+", " ", value)
     return (value[:80].rstrip(" .") or fallback)
+
+
+def lead_handoff_name(state: dict[str, Any], round_number: int) -> str:
+    lead = safe_filename(state["roles"]["lead"], "lead")
+    paper = safe_filename(state["paper"]["title"], "paper")
+    return f"{lead}_{round_number}修{paper}.md"
+
+
+def secretary_handoff_name(state: dict[str, Any], round_number: int) -> str:
+    secretary = safe_filename(state["roles"]["secretary"], "secretary")
+    lead = safe_filename(state["roles"]["lead"], "lead")
+    paper = safe_filename(state["paper"]["title"], "paper")
+    return f"{secretary}_{round_number}审{paper}_给{lead}.md"
 
 
 def round_dir(root: Path, round_number: int) -> Path:
@@ -458,10 +497,11 @@ def config_markdown(state: dict[str, Any]) -> str:
 - 每个维度最低分：{thresholds['min_dimension']}
 - 自主轮次上限：{thresholds['max_rounds']}
 - 连续停滞判据：提升小于 {thresholds['min_progress']} 分达到 2 次
+- 双向 Markdown 交接协议：v{state.get('handoff_protocol_version', 1)}
 
 ## 责任边界
 
-秘书维护本目录和评分；主力修改论文并提交完成标记；用户裁决缺证据、审稿冲突和学术真实性问题。`configured` 只表示监测参数已保存；只有 `active` 才表示调度器已登记，只有 `wake_verified` 才表示真实唤醒链路已测试。模拟审稿通过不等于期刊录用保证。
+秘书维护本目录和评分，并在每轮生成“可直接复制给主力”的 Markdown；主力修改论文并提交含“可直接复制给秘书的话”的 Markdown 完成标记。任一交接文件缺失都不得推进。用户裁决缺证据、审稿冲突和学术真实性问题。`configured` 只表示监测参数已保存；只有 `active` 才表示调度器已登记，只有 `wake_verified` 才表示真实唤醒链路已测试。模拟审稿通过不等于期刊录用保证。
 """
 
 
@@ -541,6 +581,7 @@ def command_init(args: argparse.Namespace) -> None:
             "updated_at": created,
             "phase": "awaiting_review",
             "current_round": 1,
+            "handoff_protocol_version": 2,
             "event_seq": 0,
             "last_event": None,
             "review_mode": args.review_mode,
@@ -587,6 +628,10 @@ def command_init(args: argparse.Namespace) -> None:
             "stagnation_count": 0,
             "rounds": {},
             "latest_outputs": [],
+            "handoffs": {
+                "secretary_to_lead": None,
+                "lead_to_secretary": None,
+            },
             "attention_history": [],
         }
         scaffold_round(staging, state, 1)
@@ -776,6 +821,34 @@ def validate_scorecard(
     if round_number > 1 and card.get("prior_issue_audit_complete") is not True:
         errors.append("第二轮起必须完成旧问题逐项复核。")
 
+    thresholds = state["thresholds"]
+    objective_ready = (
+        len(normalized_reviewers) == len(REVIEWERS)
+        and all(
+            item["overall"] >= thresholds["min_reviewer_overall"]
+            and all(
+                value >= thresholds["min_dimension"]
+                for value in item["dimensions"].values()
+            )
+            and item["submission_ready"]
+            for item in normalized_reviewers
+        )
+        and not all_current_issues
+        and not unresolved
+        and not recurring
+        and card.get("journal_compliance") is True
+        and card.get("source_integrity_checked") is True
+        and card.get("prior_issue_audit_complete") is True
+        and not card.get("conflicts_needing_user")
+        and not card.get("missing_evidence_actions")
+    )
+    if objective_ready and recommendation != "ready":
+        errors.append(
+            "全部客观硬门槛已满足，但秘书尚未给出 secretary_recommendation=ready。"
+        )
+    if recommendation == "ready" and not objective_ready:
+        errors.append("秘书声明 ready，但至少一项客观硬门槛尚未满足。")
+
     normalized = {
         "reviewers": normalized_reviewers,
         "all_scores": all_scores,
@@ -790,6 +863,7 @@ def validate_scorecard(
 
 def final_report_text(state: dict[str, Any], evaluation: dict[str, Any]) -> str:
     outputs = state.get("latest_outputs") or [state["paper"]["manuscript_baseline"]]
+    final_handoff = (state.get("handoffs") or {}).get("secretary_to_lead") or {}
     output_lines = []
     for item in outputs:
         output_lines.append(
@@ -822,6 +896,13 @@ def final_report_text(state: dict[str, Any], evaluation: dict[str, Any]) -> str:
 
 {chr(10).join(score_lines)}
 
+## 秘书最终确认
+
+- 秘书：{state['roles']['secretary']}
+- 结论：`{final_handoff.get('decision', 'ready')}`
+- 可复制 Markdown：`{final_handoff.get('path', '未记录')}`
+- 交接 SHA-256：`{final_handoff.get('sha256', '未记录')}`
+
 ## 已通过的硬门槛
 
 - 五位审稿人的总分均不低于 {state['thresholds']['min_reviewer_overall']}。
@@ -837,12 +918,141 @@ def final_report_text(state: dict[str, Any], evaluation: dict[str, Any]) -> str:
 """
 
 
+def secretary_handoff_text(
+    state: dict[str, Any],
+    round_number: int,
+    summary_path: Path,
+    tasks_path: Path,
+    evaluation: dict[str, Any],
+    gate_failures: list[str],
+    attention_reasons: list[str],
+    passed: bool,
+) -> str:
+    decision = "ready" if passed else ("attention_required" if attention_reasons else "revise")
+    current_outputs = state.get("latest_outputs") or [state["paper"]["manuscript_baseline"]]
+    summary_record = file_record(summary_path)
+    tasks_record = file_record(tasks_path)
+    issue_ids = sorted(
+        set(evaluation["current_issue_ids"])
+        | set(evaluation["unresolved_prior_issue_ids"])
+        | set(evaluation["recurring_issue_ids"])
+    )
+    minimum_overall = min(evaluation["all_scores"])
+    minimum_dimension = min(evaluation["all_dimensions"])
+    score_lines = [
+        f"- {reviewer['id']}：overall={reviewer['overall']:.2f}，"
+        f"submission_ready={str(reviewer['submission_ready']).lower()}"
+        for reviewer in evaluation["reviewers"]
+    ]
+    current_file_lines = [
+        f"- `{item['path']}` — {item['bytes']} bytes — SHA-256 `{item['sha256']}`"
+        for item in current_outputs
+    ]
+
+    copy_lines = [
+        f"致主修改智能体 {state['roles']['lead']}：",
+        f"秘书 {state['roles']['secretary']} 已完成 R{round_number:02d} 五审，"
+        "并已读取当前论文而不是只查看上一轮交接标记。",
+        f"本轮状态机结论为 {decision}；最低审稿人总分 {minimum_overall:.2f}/10，"
+        f"最低单项维度 {minimum_dimension:.2f}/10。",
+    ]
+    for item in current_outputs:
+        copy_lines.append(f"当前已审论文：{item['path']}（SHA-256 {item['sha256']}）")
+    if passed:
+        copy_lines.extend(
+            [
+                "五位审稿人的总分均不低于 9.0，全部维度均不低于 8.5，"
+                "P0/P1、未解决旧问题和复发问题均已清零。",
+                "本工作流确认当前版本达到模拟可投稿门槛，请停止自动改写并保留最终版本。",
+                "该结论不是期刊录用保证；投稿前仍需作者完成最终伦理、署名、格式和投稿系统核对。",
+            ]
+        )
+    elif attention_reasons:
+        copy_lines.extend(
+            [
+                "当前存在必须由作者裁决或补充证据的阻断项，暂时不要继续机械改写。",
+                "阻断项：" + "；".join(attention_reasons),
+                f"请阅读审稿汇总 {summary_path} 和修改任务单 {tasks_path}，等待用户决定后再继续。",
+            ]
+        )
+    else:
+        copy_lines.extend(
+            [
+                "当前尚未达到 9/10 硬门槛，必须继续修改。",
+                "本轮开放问题 ID：" + (", ".join(issue_ids) if issue_ids else "评分门槛未过但无有效问题 ID"),
+                f"请完整阅读审稿汇总 {summary_path} 和修改任务单 {tasks_path}，按问题 ID 修改权威源。",
+                f"修改完成后必须生成 {lead_handoff_name(state, round_number)}，"
+                "其中包含“## 可直接复制给秘书的话”、修改后文件、变更日志、"
+                "已解决/未解决问题和主力核验结果。",
+            ]
+        )
+    copy_block = "\n".join(f"> {line}" if line else ">" for line in copy_lines)
+    if passed:
+        return_requirement = "本轮已经通过全部硬门槛；无需继续修改或回交。"
+    elif attention_reasons:
+        return_requirement = (
+            "先等待用户解决阻断项；未解除 attention_required 前不得提交新一轮。"
+        )
+    else:
+        return_requirement = (
+            f"修改完成后交回 `{lead_handoff_name(state, round_number)}`，"
+            f"且必须让秘书重新读取修改后的论文，再开始 R{round_number + 1:02d} 复审。"
+        )
+
+    return f"""# {state['roles']['secretary']} → {state['roles']['lead']}：R{round_number:02d} 审稿交接
+
+- 工作流 ID：`{state['workflow_id']}`
+- 交接方向：秘书 → 主力
+- 发送者：{state['roles']['secretary']}
+- 接收者：{state['roles']['lead']}
+- 审稿轮次：R{round_number:02d}
+- 状态机结论：`{decision}`
+- 生成时间：{now_utc()}
+- 审稿汇总：`{summary_record['path']}`
+- 审稿汇总 SHA-256：`{summary_record['sha256']}`
+- 修改任务单：`{tasks_record['path']}`
+- 修改任务单 SHA-256：`{tasks_record['sha256']}`
+
+## 可直接复制给主力的话
+
+{copy_block}
+
+## 本轮五审结论
+
+{chr(10).join(score_lines)}
+
+- 最低审稿人总分：{minimum_overall:.2f} / 10
+- 最低单项维度：{minimum_dimension:.2f} / 10
+- 开放问题：{', '.join(issue_ids) if issue_ids else '无'}
+- 未通过门槛：{'；'.join(gate_failures) if gate_failures else '无'}
+- 需要用户处理：{'；'.join(attention_reasons) if attention_reasons else '无'}
+
+## 当前已审论文
+
+{chr(10).join(current_file_lines)}
+
+## 审稿汇总全文
+
+{summary_path.read_text(encoding='utf-8').strip()}
+
+## 修改任务单全文
+
+{tasks_path.read_text(encoding='utf-8').strip()}
+
+## 主力回交要求
+
+{return_requirement}
+"""
+
+
 def command_record_review(args: argparse.Namespace) -> None:
     root = resolve_workspace(args.workspace)
     with workspace_lock(root):
         state = load_state(root)
         if state["phase"] != "awaiting_review":
             fail(f"当前阶段为 {state['phase']}，不能登记审稿。")
+        if args.agent.casefold() != state["roles"]["secretary"].casefold():
+            fail(f"审稿登记者必须是已登记秘书 {state['roles']['secretary']!r}。")
         round_number = args.round or state["current_round"]
         if round_number != state["current_round"]:
             fail(f"只能登记当前轮 R{state['current_round']:02d}。")
@@ -892,6 +1102,8 @@ def command_record_review(args: argparse.Namespace) -> None:
             gate_failures.append("存在待用户裁决的审稿冲突")
         if card["missing_evidence_actions"]:
             gate_failures.append("存在缺失证据行动")
+        if card["secretary_recommendation"] != "ready":
+            gate_failures.append("秘书尚未明确确认 ready")
 
         overall_average = sum(evaluation["all_scores"]) / len(evaluation["all_scores"])
         previous_averages = [
@@ -945,7 +1157,6 @@ def command_record_review(args: argparse.Namespace) -> None:
 
         if passed:
             state["phase"] = "complete"
-            atomic_write_text(root / "最终可投稿报告.md", final_report_text(state, evaluation))
             event_type = "workflow_completed"
             audience = "all"
         elif attention_reasons:
@@ -960,6 +1171,40 @@ def command_record_review(args: argparse.Namespace) -> None:
             event_type = "revision_requested"
             audience = state["roles"]["lead"]
 
+        secretary_handoff = root / secretary_handoff_name(state, round_number)
+        if secretary_handoff.exists():
+            fail(f"秘书交接文件已存在，拒绝覆盖：{secretary_handoff}")
+        atomic_write_text(
+            secretary_handoff,
+            secretary_handoff_text(
+                state,
+                round_number,
+                summary_path,
+                tasks_path,
+                evaluation,
+                gate_failures,
+                attention_reasons,
+                passed,
+            ),
+        )
+        secretary_handoff_record = {
+            **file_record(secretary_handoff),
+            "direction": "secretary_to_lead",
+            "round": round_number,
+            "sender": state["roles"]["secretary"],
+            "recipient": state["roles"]["lead"],
+            "decision": (
+                "ready"
+                if passed
+                else ("attention_required" if attention_reasons else "revise")
+            ),
+        }
+        record["secretary_handoff"] = secretary_handoff_record
+        state.setdefault("handoffs", {})["secretary_to_lead"] = secretary_handoff_record
+
+        if passed:
+            atomic_write_text(root / "最终可投稿报告.md", final_report_text(state, evaluation))
+
         event = commit(
             root,
             state,
@@ -972,9 +1217,22 @@ def command_record_review(args: argparse.Namespace) -> None:
                 "attention_reasons": attention_reasons,
                 "summary": str(summary_path),
                 "tasks": str(tasks_path),
+                "handoff": str(secretary_handoff),
+                "copyable_heading": "## 可直接复制给主力的话",
             },
         )
-    print(json.dumps({"phase": state["phase"], "event": event, "gate_failures": gate_failures}, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "phase": state["phase"],
+                "handoff": str(secretary_handoff),
+                "event": event,
+                "gate_failures": gate_failures,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 def complete_revision(args: argparse.Namespace, existing_marker: Path | None = None) -> None:
@@ -1002,10 +1260,9 @@ def complete_revision(args: argparse.Namespace, existing_marker: Path | None = N
             fail(f"问题不能同时标为已解决和未解决：{sorted(overlap)}")
         unresolved = sorted(open_issues - resolved)
         round_number = state["current_round"]
-        agent_name = safe_filename(state["roles"]["lead"], "lead")
-        paper_name = safe_filename(state["paper"]["title"], "paper")
-        expected_prefix = f"{agent_name}_{round_number}修"
-        generated_marker = root / f"{expected_prefix}{paper_name}.md"
+        next_round = round_number + 1
+        expected_prefix = f"{safe_filename(state['roles']['lead'], 'lead')}_{round_number}修"
+        generated_marker = root / lead_handoff_name(state, round_number)
         if existing_marker is None:
             marker = generated_marker
             if marker.exists():
@@ -1021,14 +1278,45 @@ def complete_revision(args: argparse.Namespace, existing_marker: Path | None = N
 
         output_records = [file_record(path) for path in outputs]
         change_record = file_record(change_log)
+        copy_lines = [
+            f"致秘书智能体 {state['roles']['secretary']}：",
+            f"我是主修改智能体 {state['roles']['lead']}，已完成 R{round_number:02d} 修改。",
+        ]
+        for item in output_records:
+            copy_lines.append(
+                f"请重新打开并完整审阅修改后论文 {item['path']}（SHA-256 {item['sha256']}），"
+                "不要只依据本交接文件判断修改是否完成。"
+            )
+        copy_lines.extend(
+            [
+                f"变更日志：{change_record['path']}（SHA-256 {change_record['sha256']}）。",
+                "我声明已解决的问题 ID："
+                + (", ".join(sorted(resolved)) if resolved else "无"),
+                "仍未解决的问题 ID：" + (", ".join(unresolved) if unresolved else "无"),
+                "请沿用上一轮问题 ID，先复核旧问题，再检查新矛盾、引用/数字/图表一致性"
+                "以及新增的防御性写作。",
+                f"完成 R{next_round:02d} 五审后，请输出 "
+                f"{secretary_handoff_name(state, next_round)}，其中必须包含"
+                "“## 可直接复制给主力的话”和完整审稿意见。",
+                "只有五位审稿人分别达到总分 9.0、各维度不低于 8.5，"
+                "且所有硬伤、必改、未解决和复发问题清零后，才能确认达到模拟可投稿门槛。",
+            ]
+        )
+        copy_block = "\n".join(f"> {line}" if line else ">" for line in copy_lines)
         marker_text = f"""# {state['roles']['lead']} 第 {round_number} 次修改完成
 
 - 工作流 ID：`{state['workflow_id']}`
+- 交接方向：主力 → 秘书
 - 修改轮次：{round_number}
 - 主力：{state['roles']['lead']}
+- 接收者：{state['roles']['secretary']}
 - 生成时间：{now_utc()}
 - 变更日志：`{change_record['path']}`
 - 变更日志 SHA-256：`{change_record['sha256']}`
+
+## 可直接复制给秘书的话
+
+{copy_block}
 
 ## 修改后文件
 
@@ -1048,16 +1336,50 @@ def complete_revision(args: argparse.Namespace, existing_marker: Path | None = N
 
 ## 复审要求
 
-秘书必须打开以上修改后文件，并在上一轮问题清单基础上逐项复核；本标记不能替代论文正文或变更日志。
+秘书必须打开以上修改后文件，并在上一轮问题清单基础上逐项复核；本标记不能替代论文正文或变更日志。复审结束后必须生成一份含“## 可直接复制给主力的话”的秘书→主力 Markdown 交接文件。
 """
         if existing_marker is None:
             atomic_write_text(marker, marker_text)
+        marker_errors: list[str] = []
+        validate_completed_markdown(
+            marker,
+            REQUIRED_LEAD_HANDOFF_HEADINGS,
+            350,
+            marker_errors,
+        )
+        if existing_marker is not None:
+            external_text = marker.read_text(encoding="utf-8")
+            required_tokens = [
+                state["workflow_id"],
+                state["roles"]["lead"],
+                state["roles"]["secretary"],
+                str(change_log),
+                change_record["sha256"],
+            ]
+            for item in output_records:
+                required_tokens.extend([item["path"], item["sha256"]])
+            for token in required_tokens:
+                if token not in external_text:
+                    marker_errors.append(f"{marker.name} 缺少交接关键值：{token}")
+        if marker_errors:
+            fail("主力→秘书 Markdown 交接未通过校验：\n- " + "\n- ".join(marker_errors))
+
+        marker_record = file_record(marker)
+        lead_handoff_record = {
+            **marker_record,
+            "direction": "lead_to_secretary",
+            "round": round_number,
+            "sender": state["roles"]["lead"],
+            "recipient": state["roles"]["secretary"],
+            "decision": "revision_completed",
+        }
         state["latest_outputs"] = output_records
         state["rounds"][str(round_number)]["revision"] = {
             "completed_at": now_utc(),
             "agent": state["roles"]["lead"],
             "marker": str(marker),
-            "marker_record": file_record(marker),
+            "marker_record": marker_record,
+            "lead_handoff": lead_handoff_record,
             "marker_origin": "bridge_generated" if existing_marker is None else "external_agent",
             "outputs": output_records,
             "change_log": change_record,
@@ -1065,7 +1387,7 @@ def complete_revision(args: argparse.Namespace, existing_marker: Path | None = N
             "unresolved_issue_ids": unresolved,
             "checks": checks,
         }
-        next_round = round_number + 1
+        state.setdefault("handoffs", {})["lead_to_secretary"] = lead_handoff_record
         state["current_round"] = next_round
         state["phase"] = "awaiting_review"
         scaffold_round(root, state, next_round)
@@ -1078,11 +1400,24 @@ def complete_revision(args: argparse.Namespace, existing_marker: Path | None = N
                 "reason": "revision_completed",
                 "completed_revision": round_number,
                 "marker": str(marker),
+                "handoff": str(marker),
+                "copyable_heading": "## 可直接复制给秘书的话",
                 "outputs": [item["path"] for item in output_records],
                 "carried_open_issue_ids": unresolved,
             },
         )
-    print(json.dumps({"marker": str(marker), "next_round": next_round, "event": event}, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "marker": str(marker),
+                "handoff": str(marker),
+                "next_round": next_round,
+                "event": event,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 def command_lead_done(args: argparse.Namespace) -> None:
@@ -1182,7 +1517,10 @@ def command_scan(args: argparse.Namespace) -> None:
                 state["roles"]["secretary"],
                 {
                     "markers": records,
-                    "warning": "检测只证明文件出现；秘书仍须核验标记和修改后论文。",
+                    "warning": (
+                        "检测只证明文件出现；秘书仍须核验“可直接复制给秘书的话”、"
+                        "修改后论文、变更日志和文件散列，再使用 accept-marker。"
+                    ),
                 },
             )
         else:
@@ -1290,6 +1628,7 @@ def command_status(args: argparse.Namespace) -> None:
         "lead": state["roles"]["lead"],
         "secretary": state["roles"]["secretary"],
         "open_issue_ids": state.get("open_issue_ids", []),
+        "handoffs": state.get("handoffs", {}),
         "monitor": state.get("monitor"),
         "last_event": state.get("last_event"),
         "next_action": phase_next_action(state),
@@ -1324,6 +1663,10 @@ def command_verify(args: argparse.Namespace) -> None:
     state = load_state(root)
     errors: list[str] = []
     warnings: list[str] = []
+    protocol_version = state.get("handoff_protocol_version", 1)
+    if not isinstance(protocol_version, int) or protocol_version < 1:
+        errors.append(f"双向交接协议版本无效：{protocol_version!r}")
+        protocol_version = 1
     if Path(state.get("workspace", "")).resolve() != root:
         errors.append("状态文件中的 workspace 与当前目录不一致。")
     if state.get("intake", {}).get("confirmed") is not True:
@@ -1339,6 +1682,8 @@ def command_verify(args: argparse.Namespace) -> None:
         errors.append("秘书不在全部 AI 列表中。")
     if state["roles"]["lead"].casefold() == state["roles"]["secretary"].casefold():
         errors.append("主力和秘书角色相同。")
+    if protocol_version >= 2 and not isinstance(state.get("handoffs"), dict):
+        errors.append("双向交接协议 v2 缺少 handoffs 状态。")
     for key in ("manuscript",):
         if not Path(state["paper"].get(key, "")).is_file():
             errors.append(f"论文路径不存在：{state['paper'].get(key)}")
@@ -1387,10 +1732,42 @@ def command_verify(args: argparse.Namespace) -> None:
         for _, filename, _ in REVIEWERS:
             if not (directory / filename).is_file():
                 errors.append(f"R{number:02d} 缺少审稿文件：{filename}")
+        secretary_handoff = record.get("secretary_handoff")
+        if record.get("recorded_at"):
+            if not isinstance(secretary_handoff, dict):
+                message = f"R{number:02d} 缺少秘书→主力 Markdown 交接记录。"
+                if protocol_version >= 2:
+                    errors.append(message)
+                else:
+                    warnings.append(message + "这是旧版工作流。")
+            else:
+                handoff_path = Path(secretary_handoff.get("path", ""))
+                validate_completed_markdown(
+                    handoff_path,
+                    REQUIRED_SECRETARY_HANDOFF_HEADINGS,
+                    500,
+                    errors,
+                )
+                if handoff_path.is_file() and sha256_file(handoff_path) != secretary_handoff.get("sha256"):
+                    errors.append(f"R{number:02d} 的秘书→主力交接文件在登记后发生变化。")
         revision = record.get("revision")
         if revision:
-            if not Path(revision.get("marker", "")).is_file():
+            marker_path = Path(revision.get("marker", ""))
+            if not marker_path.is_file():
                 errors.append(f"R{number:02d} 的完成标记不存在。")
+            elif protocol_version >= 2:
+                validate_completed_markdown(
+                    marker_path,
+                    REQUIRED_LEAD_HANDOFF_HEADINGS,
+                    350,
+                    errors,
+                )
+                marker_record = revision.get("marker_record") or {}
+                if sha256_file(marker_path) != marker_record.get("sha256"):
+                    errors.append(f"R{number:02d} 的主力→秘书交接文件在登记后发生变化。")
+                lead_handoff = revision.get("lead_handoff")
+                if not isinstance(lead_handoff, dict):
+                    errors.append(f"R{number:02d} 缺少主力→秘书交接记录。")
             for item in revision.get("outputs", []):
                 path = Path(item.get("path", ""))
                 if not path.is_file():
@@ -1506,15 +1883,22 @@ def build_parser() -> argparse.ArgumentParser:
     deactivate_parser.add_argument("--note", required=True)
     deactivate_parser.set_defaults(func=command_monitor_deactivate)
 
-    review_parser = subparsers.add_parser("record-review", help="校验并登记当前轮五审结果。")
+    review_parser = subparsers.add_parser(
+        "record-review",
+        help="校验当前轮五审，并强制生成秘书→主力 Markdown 交接。",
+    )
     review_parser.add_argument("--workspace", required=True)
+    review_parser.add_argument("--agent", required=True, help="必须是已登记秘书智能体。")
     review_parser.add_argument("--round", type=int)
     review_parser.add_argument("--scorecard", help="自定义评分卡路径。")
     review_parser.add_argument("--summary", help="自定义审稿汇总路径。")
     review_parser.add_argument("--tasks", help="自定义修改任务单路径。")
     review_parser.set_defaults(func=command_record_review)
 
-    done_parser = subparsers.add_parser("lead-done", help="登记主力修改完成并创建下一轮。")
+    done_parser = subparsers.add_parser(
+        "lead-done",
+        help="登记主力修改完成，生成可复制给秘书的 Markdown 并创建下一轮。",
+    )
     done_parser.add_argument("--workspace", required=True)
     done_parser.add_argument("--agent", required=True)
     done_parser.add_argument("--output", action="append", required=True, help="修改后文件；可重复。")
@@ -1524,7 +1908,10 @@ def build_parser() -> argparse.ArgumentParser:
     done_parser.add_argument("--check", action="append", required=True, help="已执行的编译/一致性核验；可重复。")
     done_parser.set_defaults(func=command_lead_done)
 
-    accept_parser = subparsers.add_parser("accept-marker", help="核验并登记外部主力已经写入的完成标记。")
+    accept_parser = subparsers.add_parser(
+        "accept-marker",
+        help="核验外部主力的 Markdown 交接并登记完成标记。",
+    )
     accept_parser.add_argument("--workspace", required=True)
     accept_parser.add_argument("--marker", required=True, help="协作目录根部的外部完成标记。")
     accept_parser.add_argument("--agent", required=True)
