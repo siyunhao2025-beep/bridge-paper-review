@@ -1,0 +1,4 @@
+interface:
+  display_name: "协同审稿与论文优化"
+  short_description: "先确认路径、角色与监测方式，再闭环协同五审和改稿流程"
+  default_prompt: "使用 $paper-revision-bridge；先向我确认论文路径、协作目录、AI 角色和定时检索设置，再开始闭环审稿与修改。"
