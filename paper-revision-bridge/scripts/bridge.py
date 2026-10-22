@@ -1353,14 +1353,35 @@ def complete_revision(args: argparse.Namespace, existing_marker: Path | None = N
                 state["workflow_id"],
                 state["roles"]["lead"],
                 state["roles"]["secretary"],
-                str(change_log),
                 change_record["sha256"],
             ]
             for item in output_records:
-                required_tokens.extend([item["path"], item["sha256"]])
+                required_tokens.append(item["sha256"])
             for token in required_tokens:
                 if token not in external_text:
                     marker_errors.append(f"{marker.name} 缺少交接关键值：{token}")
+
+            def normalized_path_token(value: str | Path) -> str:
+                normalized = str(value).replace("\\", "/")
+                return normalized.casefold() if os.name == "nt" else normalized
+
+            normalized_external = normalized_path_token(external_text)
+            path_requirements = [
+                ("变更日志", change_record["path"], args.change_log),
+                *(
+                    ("修改后文件", record["path"], raw)
+                    for record, raw in zip(output_records, args.output)
+                ),
+            ]
+            for label, canonical, raw in path_requirements:
+                candidates = {normalized_path_token(canonical)}
+                raw_path = Path(raw).expanduser()
+                if raw_path.is_absolute():
+                    candidates.add(normalized_path_token(raw_path))
+                if not any(candidate in normalized_external for candidate in candidates):
+                    marker_errors.append(
+                        f"{marker.name} 缺少{label}绝对路径：{canonical}"
+                    )
         if marker_errors:
             fail("主力→秘书 Markdown 交接未通过校验：\n- " + "\n- ".join(marker_errors))
 

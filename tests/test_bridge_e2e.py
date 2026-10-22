@@ -222,11 +222,16 @@ def main() -> None:
     revised.write_text("\\documentclass{article}\n\\begin{document}Revised\\end{document}\n", encoding="utf-8")
     revised_pdf.write_bytes(b"%PDF-1.4\n% test fixture\n")
     change_log.write_text("# Change log\n\nResolved all five test issues with exact locations.\n", encoding="utf-8")
+    path_alias_dir = TEST_ROOT / "path-alias"
+    path_alias_dir.mkdir()
+    revised_arg = path_alias_dir / ".." / revised.name
+    revised_pdf_arg = path_alias_dir / ".." / revised_pdf.name
+    change_log_arg = path_alias_dir / ".." / change_log.name
     lead_args = [
         "accept-marker", "--workspace", str(workspace),
         "--marker", str(fake_external_marker), "--agent", "GPT",
-        "--output", str(revised), "--output", str(revised_pdf),
-        "--change-log", str(change_log),
+        "--output", str(revised_arg), "--output", str(revised_pdf_arg),
+        "--change-log", str(change_log_arg),
         "--check", "LaTeX compile and cross-reference checks passed",
         "--check", "Rendered PDF matches the editable source",
     ]
@@ -241,19 +246,19 @@ def main() -> None:
 - 修改轮次：1
 - 主力：GPT
 - 接收者：Workbuddy
-- 变更日志：`{change_log}`
+- 变更日志：`{change_log_arg}`
 - 变更日志 SHA-256：`{sha256(change_log)}`
 
 ## 可直接复制给秘书的话
 
-> 致秘书 Workbuddy：GPT 已完成第一轮修改。请重新打开 {revised} 和 {revised_pdf}，
-> 核对变更日志 {change_log}，逐项复核旧问题，再检查新增矛盾和防御性写作。
+> 致秘书 Workbuddy：GPT 已完成第一轮修改。请重新打开 {revised_arg} 和 {revised_pdf_arg}，
+> 核对变更日志 {change_log_arg}，逐项复核旧问题，再检查新增矛盾和防御性写作。
 > 不要只读取本标记。完成复审后，请把完整审稿意见写成可复制给主力的 Markdown。
 
 ## 修改后文件
 
-- `{revised}` — SHA-256 `{sha256(revised)}`
-- `{revised_pdf}` — SHA-256 `{sha256(revised_pdf)}`
+- `{revised_arg}` — SHA-256 `{sha256(revised)}`
+- `{revised_pdf_arg}` — SHA-256 `{sha256(revised_pdf)}`
 
 ## 已解决问题
 
