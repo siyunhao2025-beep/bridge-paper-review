@@ -109,6 +109,10 @@ def fill_round(workspace: Path, round_number: int, passing: bool, prior_ids: lis
 
 
 def main() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
     TEST_ROOT.mkdir(parents=True, exist_ok=True)
     manuscript = TEST_ROOT / "paper.tex"
     editable = TEST_ROOT / "paper-working.tex"
